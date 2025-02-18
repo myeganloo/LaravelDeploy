@@ -1,0 +1,210 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  DOCKER_IMAGE: docker:27.1.1-dind
+  REGISTRY_LOGIN: docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+  IMAGE_PATH_PHP: reg.<GitDomain.com>/app/app/php
+  IMAGE_PATH_NGX: reg.<GitDomain.com>/app/app/ngx
+  VERSION: v1.0.0
+  PROJECT_DIR: /opt/services/app
+
+build-images:
+  cache: { }
+  image: ${DOCKER_IMAGE}
+  stage: build
+  before_script:
+    - ${REGISTRY_LOGIN}
+  script:
+    - cd deploy/php/
+    - docker build -t ${IMAGE_PATH_PHP}:${CI_COMMIT_SHORT_SHA} .
+    - docker push ${IMAGE_PATH_PHP}:${CI_COMMIT_SHORT_SHA}
+    - cd ../ngx/
+    - docker build -t ${IMAGE_PATH_NGX}:${CI_COMMIT_SHORT_SHA} .
+    - docker push ${IMAGE_PATH_NGX}:${CI_COMMIT_SHORT_SHA}
+  only: [ 'develop' ,'master','merge_requests' ]
+
+test-images:
+  image: ${DOCKER_IMAGE}
+  needs: [ 'build-images' ]
+  stage: test
+  before_script:
+    - ${REGISTRY_LOGIN}
+  script:
+    - docker tag ${IMAGE_PATH_PHP}:${CI_COMMIT_SHORT_SHA} ${IMAGE_PATH_PHP}:${VERSION}
+    - docker tag ${IMAGE_PATH_PHP}:${CI_COMMIT_SHORT_SHA} ${IMAGE_PATH_PHP}:latest
+    - docker push ${IMAGE_PATH_PHP}:${VERSION}
+    - docker push ${IMAGE_PATH_PHP}:latest
+    - docker tag ${IMAGE_PATH_NGX}:${CI_COMMIT_SHORT_SHA} ${IMAGE_PATH_NGX}:${VERSION}
+    - docker tag ${IMAGE_PATH_NGX}:${CI_COMMIT_SHORT_SHA} ${IMAGE_PATH_NGX}:latest
+    - docker push ${IMAGE_PATH_NGX}:${VERSION}
+    - docker push ${IMAGE_PATH_NGX}:latest
+  only: [ 'develop' ,'master' ,'merge_requests' ]
+
+phpunit:
+  image: ${DOCKER_IMAGE}
+  stage: test
+  needs: [ 'build-images' ]
+  variables:
+    DOMAIN_NAME: staging.domain.local
+    TRAEFIK_SUB: web
+    RABBIT_SUB: rmq
+    app_API_SUB: api
+    STAGE: development
+    SSH_ADDR: <*******>
+    SSH_PORT: <*******>
+    SSH_USER: root
+    DIR: /tmp/${CI_JOB_ID}/${CI_PROJECT_PATH_SLUG}
+  before_script:
+    - ${REGISTRY_LOGIN}
+    - 'command -v ssh-agent >/dev/null || ( apk add --update openssh )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$SSH_PRIVATE_KEY_Stage")
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no -p ${SSH_PORT} ${SSH_USER}@${SSH_ADDR} "
+      ${REGISTRY_LOGIN} &&
+      mkdir -p ${DIR} &&
+      cd ${DIR} &&
+      git clone -b ${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME} ${CI_REPOSITORY_URL} &&
+      cd $CI_PROJECT_NAME &&
+      git status &&
+      sed -i 's/STAGE/${STAGE}/g' compose.yml &&
+      sed -i 's/VERSION/${VERSION}/g' compose.yml &&
+      sed -i 's/FRONT_DOMAIN/${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/RABBIT_DOMAIN/${RABBIT_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/app_API_DOMAIN/${app_API_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/TRAEFIK_DOMAIN/${TRAEFIK_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      chown -R 1000:1000 storage &&
+      cp .env.test.example .env.test &&
+      cat .env.test &&
+      docker compose -f compose.yml pull &&
+      docker compose -f compose.yml up -d
+      sleep 5 &&
+      docker exec -i --user root app composer install --optimize-autoloader --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+      docker exec -i --user root app php artisan migrate --env=test
+      docker exec -i --user root app php artisan optimize:clear --env=test
+      docker exec -i --user root app php artisan test -p --processes=8
+      rm -rf ${DIR}
+      "
+
+  environment:
+    name: phpunit
+    url: https://${DOMAIN_NAME}
+  only:
+    - merge_requests
+
+development:
+  image: ${DOCKER_IMAGE}
+  stage: deploy
+  needs: [ 'test-images' ]
+  variables:
+    DOMAIN_NAME: staging.domain.local
+    TRAEFIK_SUB: web
+    RABBIT_SUB: rmq
+    app_API_SUB: api
+    STAGE: development
+    SSH_ADDR: <*******>
+    SSH_PORT: <*******>
+    SSH_USER: root
+  before_script:
+    - ${REGISTRY_LOGIN}
+    - 'command -v ssh-agent >/dev/null || ( apk add --update openssh )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$SSH_PRIVATE_KEY_Stage")
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no -p ${SSH_PORT} ${SSH_USER}@${SSH_ADDR} "
+      ${REGISTRY_LOGIN} &&
+      cd ${PROJECT_DIR} &&
+      git checkout develop &&
+      git reset --hard &&
+      git pull --force  &&
+      sed -i 's/STAGE/${STAGE}/g' compose.yml &&
+      sed -i 's/VERSION/${VERSION}/g' compose.yml &&
+      sed -i 's/FRONT_DOMAIN/${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/RABBIT_DOMAIN/${RABBIT_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/app_API_DOMAIN/${app_API_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/TRAEFIK_DOMAIN/${TRAEFIK_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/FRONT_DOMAIN/${DOMAIN_NAME}/g' .env.example &&
+      sed -i 's|^AWS_ACCESS_KEY_ID=.*|AWS_ACCESS_KEY_ID=${STG_AWS_ACCESS_KEY_ID}|g' .env.example &&
+      sed -i 's|^AWS_SECRET_ACCESS_KEY=.*|AWS_SECRET_ACCESS_KEY=${STG_AWS_SECRET_ACCESS_KEY}|g' .env.example &&
+      sed -i 's|^SENTRY_LARAVEL_DSN=.*|SENTRY_LARAVEL_DSN=${STG_SENTRY_LARAVEL_DSN}|g' .env.example &&
+  
+      cp .env.example .env &&
+      docker compose -f compose.yml pull &&
+      docker compose -f compose.yml up -d
+      sleep 5
+      rm bootstrap/cache/packages.php
+      rm bootstrap/cache/services.php
+      docker exec -i --user root app  composer install --optimize-autoloader --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+      docker exec -i --user root app  composer dump
+      docker exec -i --user root app php artisan optimize:clear
+      docker exec -i --user root app php artisan optimize
+      docker exec -i --user root app php artisan about
+      docker exec -i --user root app php artisan queue:restart
+      docker exec -i --user root app php artisan migrate --seed --force
+      "
+  environment:
+    name: stage
+    url: https://${DOMAIN_NAME}
+  only: [ 'develop' ]
+
+production:
+  image: ${DOCKER_IMAGE}
+  stage: deploy
+  needs: [ 'test-images' ]
+  variables:
+    DOMAIN_NAME: DOMAIN.COM
+    TRAEFIK_SUB: web
+    RABBIT_SUB: rmq
+    app_API_SUB: api
+    STAGE: production
+    SSH_ADDR: <*******>
+    SSH_PORT: <*******>
+    SSH_USER: root
+  before_script:
+    - ${REGISTRY_LOGIN}
+    - 'command -v ssh-agent >/dev/null || ( apk add --update openssh )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$SSH_PRIVATE_KEY_PROD")
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no -p ${SSH_PORT} ${SSH_USER}@${SSH_ADDR} "
+      ${REGISTRY_LOGIN} &&
+      cd ${PROJECT_DIR} &&
+      git checkout master &&
+      git reset --hard &&
+      git pull --force  &&
+      sed -i 's/STAGE/${STAGE}/g' compose.yml &&
+      sed -i 's/VERSION/${VERSION}/g' compose.yml &&
+      sed -i 's/FRONT_DOMAIN/${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/RABBIT_DOMAIN/${RABBIT_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/app_API_DOMAIN/${app_API_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/TRAEFIK_DOMAIN/${TRAEFIK_SUB}.${DOMAIN_NAME}/g' compose.yml &&
+      sed -i 's/FRONT_DOMAIN/${DOMAIN_NAME}/g' .env.example &&
+      sed -i 's|^SENTRY_LARAVEL_DSN=.*|SENTRY_LARAVEL_DSN=${SENTRY_LARAVEL_DSN}|g' .env.example &&
+      chown -R 1000:1000 storage &&
+      cp .env.example .env &&
+      docker compose -f compose.yml pull &&
+      docker compose -f compose.yml up -d &&
+      sleep 5 &&
+      docker exec -i --user root app composer install --optimize-autoloader --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts &&
+      docker exec -i --user root app php artisan optimize:clear
+      docker exec -i --user root app php artisan optimize
+      docker exec -i --user root app php artisan about
+      docker exec -i --user root app php artisan migrate --seed --force
+      docker exec -i --user root app php artisan queue:restart
+      docker restart app
+      "
+  environment:
+    name: production
+    url: https://${DOMAIN_NAME}
+  only: [ 'master' ]
+
+  #

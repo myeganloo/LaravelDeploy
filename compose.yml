@@ -1,0 +1,227 @@
+networks:
+    app_net:
+        name: app_net
+        driver: bridge
+        external: true
+    web_net:
+        name: web_net
+        driver: bridge
+        external: true
+
+volumes:
+    db-data:
+        name: db-data
+    rmq_data:
+        name: rmq_data
+    mongo_data:
+        name: mongo_data
+    traefik-acme:
+        name: traefik-acme
+
+services:
+    traefik:
+        image: traefik:v2.11.6
+        container_name: traefik_STAGE
+        hostname: traefik_STAGE
+        command:
+            - "--log.level=ERROR"
+            - "--log.filepath=/log-file.log"
+            - "--log.format=json"
+            - "--api=true"
+            - "--api.insecure=true"
+            - "--ping=true"
+            - "--accesslog=true"
+            - "--accesslog.fields.names.StartUTC=drop"
+            - "--accesslog.bufferingsize=250"
+            - "--providers.docker=true"
+            - "--providers.docker.swarmMode=false"
+            - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+            - "--providers.docker.exposedbydefault=false"
+            - "--providers.docker.network=web_net"
+            - "--entrypoints.http.address=:80"
+            - "--entrypoints.https.address=:443"
+            - "--metrics.prometheus=true"
+            - "--entryPoints.metrics.address=:8082"
+            - "--metrics.prometheus.entryPoint=metrics"
+            - "--certificatesresolvers.mycert.acme.email=Email@Domain.com"
+            - "--certificatesresolvers.mycert.acme.storage=/acme/acme.json"
+            - "--certificatesresolvers.mycert.acme.tlschallenge=true"
+            - "--providers.file.filename=/traefik/config.yml"
+        ports:
+            - "80:80"
+            - "443:443"
+        networks:
+            - web_net
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+            - traefik-acme:/acme
+            - ./deploy/traefikconf:/traefik
+        environment:
+            - "TZ=Asia/Tehran"
+        restart: always
+        labels:
+            - "traefik.enable=true"
+            - "traefik.docker.network=web_net"
+            - "traefik.http.routers.traefik.entrypoints=http"
+            - "traefik.http.routers.traefik.rule=Host(`TRAEFIK_DOMAIN`)"
+            - "traefik.http.middlewares.web-auth.basicauth.users=<<Username>>:{SHA}<<PASS>>="
+            - "traefik.http.routers.traefik.middlewares=web-auth"
+            - "traefik.http.services.traefik.loadbalancer.server.port=8080"
+            - "traefik.http.routers.traefik.middlewares=https-redirect"
+            - "traefik.http.routers.traefik-secure.service=traefik"
+            - "traefik.http.routers.traefik-secure.service=traefik"
+            - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+            - "traefik.http.routers.traefik-secure.entrypoints=https"
+            - "traefik.http.routers.traefik-secure.rule=Host(`TRAEFIK_DOMAIN`)"
+            - "traefik.http.routers.traefik-secure.tls=true"
+            - "traefik.http.routers.traefik-secure.tls.options=default"
+            - "traefik.http.routers.traefik-secure.middlewares=web-auth"
+            - "traefik.http.routers.traefik-secure.tls.certresolver=mycert"
+            - "traefik.http.routers.traefik-monitoring.entrypoints=http"
+            - "traefik.http.routers.traefik-monitoring.rule=Host(`trmetrics.monitoring.Domain.COM`)"
+            - "traefik.http.routers.traefik-monitoring.middlewares=https-redirect"
+            - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+            - "traefik.http.routers.traefik-monitoring-secure.entrypoints=https"
+            - "traefik.http.routers.traefik-monitoring-secure.rule=Host(`trmetrics.monitoring.Domain.COM`)"
+            - "traefik.http.routers.traefik-monitoring-secure.tls=true"
+            - "traefik.http.routers.traefik-monitoring-secure.tls.options=default"
+            - "traefik.http.routers.traefik-monitoring-secure.middlewares=web-auth"
+            - "traefik.http.routers.traefik-monitoring-secure.tls.certresolver=mycert"
+            - "traefik.http.routers.traefik-monitoring-secure.service=traefik-monitoring"
+            - "traefik.http.services.traefik-monitoring.loadbalancer.server.port=8082"
+
+
+    app-app:
+        container_name: app-app
+        image: reg.<GitDomain.com>/app/app/php:VERSION
+        volumes:
+            - .:/var/www
+            - ./deploy/php/php.ini:/usr/local/etc/php/php.ini
+        depends_on:
+            app-mysql:
+                condition: service_started
+        networks:
+            - app_net
+            - web_net
+        extra_hosts:
+            - "apim.sdb247.com:5.202.127.161"
+
+    app-nginx:
+        container_name: app-nginx
+        image: reg.<GitDomain.com>/app/app/ngx:VERSION
+        volumes:
+            - /etc/localtime:/etc/localtime:ro
+            - ./:/var/www
+        depends_on:
+            - app-app
+        environment:
+            NGINX_FPM_HOST: app-app
+            NGINX_ROOT: /usr/src/app/public
+        networks:
+            - app_net
+            - web_net
+        labels:
+            - "traefik.enable=true"
+            - "traefik.docker.network=web_net"
+            - "traefik.http.routers.app.entrypoints=http"
+            - "traefik.http.routers.app.rule=Host(`app_API_DOMAIN`)"
+            - "traefik.http.services.app.loadbalancer.server.port=80"
+            - "traefik.http.routers.app.middlewares=https-redirect"
+            - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+            - "traefik.http.routers.app-secure.entrypoints=https"
+            - "traefik.http.routers.app-secure.rule=Host(`app_API_DOMAIN`)"
+            - "traefik.http.routers.app-secure.tls=true"
+            - "traefik.http.routers.app-secure.tls.options=default"
+            - "traefik.http.routers.app-secure.tls.certresolver=mycert"
+
+    app-mysql:
+        container_name: 'app-mysql'
+        image: 'mariadb:10.4'
+        restart: always
+        volumes:
+            - db-data:/var/lib/mysql
+        environment:
+            MYSQL_DATABASE: app
+            MYSQL_ROOT_PASSWORD: root
+            MYSQL_USER: root
+            MYSQL_PASSWORD: root
+        healthcheck:
+            test: [ "CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent" ]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        networks:
+            - app_net
+
+    app-rmq:
+        image: rabbitmq:management-alpine
+        container_name: app-rmq
+        hostname: app-rmq
+        restart: always
+        volumes:
+            - rmq_data:/var/lib/rabbitmq
+        networks:
+            - app_net
+            - web_net
+        environment:
+            - "RABBITMQ_DEFAULT_USER=<<Username>>"
+            - "RABBITMQ_DEFAULT_PASS=LKlvbF*&BNM<----------->fsdfsdfdPTyjI1W"
+            - "RABBITMETRICS=rabbitmetrics"
+        healthcheck:
+            test: rabbitmq-diagnostics -q ping
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        labels:
+            - "traefik.enable=true"
+            - "traefik.docker.network=web_net"
+            - "traefik.http.routers.rabbitmq-ui.entrypoints=http"
+            - "traefik.http.routers.rabbitmq-ui.rule=Host(`rmq.Domain.COM`)"
+            - "traefik.http.services.rabbitmq-ui.loadbalancer.server.port=15672"
+            - "traefik.http.routers.rabbitmq-secure.entrypoints=https"
+            - "traefik.http.routers.rabbitmq-secure.rule=Host(`rmq.Domain.COM`)"
+            - "traefik.http.routers.rabbitmq-secure.tls=true"
+            - "traefik.http.routers.rabbitmq-secure.tls.options=default"
+            - "traefik.http.routers.rabbitmq-secure.tls.certresolver=mycert"
+            - "traefik.http.routers.rabbitmq-ui.middlewares=https-redirect"
+            - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+            - "traefik.http.routers.rabbitmq-secure.service=rabbitmq-ui"
+            - "traefik.http.routers.rabbitmetrics.entrypoints=http"
+            - "traefik.http.routers.rabbitmetrics.rule=Host(`rabbitmetrics.monitoring.Domain.COM`)"
+            - "traefik.http.routers.rabbitmetrics.middlewares=https-redirect"
+            - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+            - "traefik.http.routers.rabbitmetrics-secure.entrypoints=https"
+            - "traefik.http.routers.rabbitmetrics-secure.rule=Host(`rabbitmetrics.monitoring.Domain.COM`)"
+            - "traefik.http.routers.rabbitmetrics-secure.tls=true"
+            - "traefik.http.routers.rabbitmetrics-secure.tls.options=default"
+            - "traefik.http.routers.rabbitmetrics-secure.middlewares=web-auth"
+            - "traefik.http.routers.rabbitmetrics-secure.tls.certresolver=mycert"
+            - "traefik.http.routers.rabbitmetrics-secure.service=rabbitmetrics"
+            - "traefik.http.services.rabbitmetrics.loadbalancer.server.port=15692"
+
+
+    app-redis:
+        container_name: 'app-redis'
+        image: redis:alpine
+        healthcheck:
+            test: [ "CMD-SHELL", "redis-cli ping | grep PONG" ]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        volumes:
+            - ./data:/data
+        command: redis-server --stop-writes-on-bgsave-error no
+        networks:
+            - app_net
+
+    app-mongo:
+        image: 'mongo'
+        restart: 'always'
+        environment:
+            MONGO_INITDB_ROOT_USERNAME: '${MONGO_DB_USERNAME}'
+            MONGO_INITDB_ROOT_PASSWORD: '${MONGO_DB_PASSWORD}'
+            MONGO_INITDB_DATABASE: '${MONGO_DB_DATABASE}'
+        volumes:
+            - mongo_data:/data/db
+        networks:
+            - app_net
